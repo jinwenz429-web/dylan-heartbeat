@@ -88,12 +88,39 @@ function appendDiaryEntry(content) {
 }
 
 // 批注 2026-07-11：推送层扩展为 Bark/ntfy；默认仍走 Bark，保护旧部署不改 .env 也能继续运行。
+function sanitizePushDiagnostic(value) {
+  let text = String(value ?? "");
+  const secrets = [
+    process.env.NTFY_TOKEN,
+    process.env.BARK_KEY,
+    process.env.TARGET_API_KEY,
+    process.env.GATEWAY_API_KEY
+  ].filter(Boolean).sort((a, b) => b.length - a.length);
+  text = text.replace(/(Bearer\s+)[^\s,}\]]+/gi, "$1[REDACTED]");
+  text = text.replace(/((?:token|key|authorization|device_key|api_key)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,}\]]+)/gi, "$1[REDACTED]");
+  for (const secret of secrets) text = text.split(secret).join("[REDACTED]");
+  return text.slice(0, 1000);
+}
+
+function ntfyServerHasPath(server) {
+  try {
+    const url = new URL(server);
+    return url.pathname !== "/" || Boolean(url.search);
+  } catch {
+    return true;
+  }
+}
+
 async function sendPushNotification({ title, body }) {
   const provider = (process.env.PUSH_PROVIDER || "bark").trim().toLowerCase();
 
   if (provider === "ntfy") {
     const topic = String(process.env.NTFY_TOPIC || "").trim();
-    if (!topic) return { ok: false, providerLabel: "ntfy", reason: "NTFY_TOPIC 未配置" };
+    if (!topic) {
+      const reason = "NTFY_TOPIC 未配置";
+      console.log(JSON.stringify({ event: "ntfy_push_config_error", reason }));
+      return { ok: false, providerLabel: "ntfy", reason };
+    }
 
     const server = (process.env.NTFY_SERVER_URL || "https://ntfy.sh").replace(/\/+$/, "");
     const headers = {
@@ -108,17 +135,48 @@ async function sendPushNotification({ title, body }) {
       tags: process.env.NTFY_TAGS
     });
 
-    const response = await fetch(server, {
-      method: "POST",
-      signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
-      headers,
-      body: JSON.stringify(payload)
-    });
-    const responseText = await response.text();
-    if (!response.ok) {
-      return { ok: false, providerLabel: "ntfy", reason: responseText || `HTTP ${response.status}` };
+    try {
+      const response = await fetch(server, {
+        method: "POST",
+        signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+        headers,
+        body: JSON.stringify(payload)
+      });
+      const responseText = await response.text();
+      if (!response.ok) {
+        const safeResponseBody = sanitizePushDiagnostic(responseText);
+        console.log(JSON.stringify({
+          event: "ntfy_push_failed",
+          status: response.status,
+          response_body: safeResponseBody,
+          server_has_path: ntfyServerHasPath(server)
+        }));
+        return {
+          ok: false,
+          providerLabel: "ntfy",
+          reason: safeResponseBody || `HTTP ${response.status}`,
+          status: response.status,
+          responseBody: safeResponseBody
+        };
+      }
+      return { ok: true, providerLabel: "ntfy" };
+    } catch (error) {
+      const errorMessage = sanitizePushDiagnostic(error?.message || String(error));
+      const errorCode = sanitizePushDiagnostic(error?.code || error?.cause?.code || error?.name || "");
+      console.log(JSON.stringify({
+        event: "ntfy_push_error",
+        error_message: errorMessage,
+        error_code: errorCode,
+        server_has_path: ntfyServerHasPath(server)
+      }));
+      return {
+        ok: false,
+        providerLabel: "ntfy",
+        reason: errorCode ? `${errorMessage} (${errorCode})` : errorMessage,
+        errorMessage,
+        errorCode
+      };
     }
-    return { ok: true, providerLabel: "ntfy" };
   }
 
   if (provider !== "bark") {
@@ -675,4 +733,4 @@ if (require.main === module) {
   console.log("==================================\n");
 }
 
-module.exports = { getLastUserTime, parseTimelineTimestamp };
+module.exports = { getLastUserTime, parseTimelineTimestamp, sendPushNotification };
