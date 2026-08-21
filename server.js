@@ -1748,7 +1748,10 @@ app.get("/admin/test-bark", { preHandler: basicAuth }, async (req, reply) => {
   appendSpecialEvent(`（${formattedTime} 刚刚给用户发了 Bark：这是一条测试推送。）`);
   reply.send({ success: true });
 });
-
+// 保活端点（不触发唤醒计时器）
+app.get('/ping', (req, res) => {
+    res.status(200).send('OK');
+});
 // ========================
 // 启动服务
 // ========================
