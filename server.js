@@ -287,6 +287,24 @@ function extractTimestampWithMemory(msg, tsDB) {
   return null;
 }
 
+function rememberMessageTimestamps(messages, tsDB, receivedAt = new Date()) {
+  let dirty = false;
+  const latestUserIndex = messages.findLastIndex(msg => msg.role === "user");
+  for (const [index, msg] of messages.entries()) {
+    if (msg.role === "system" || msg.role === "tool") continue;
+    const contentTimestamp = extractTimestamp(normalizeContentToText(msg.content));
+    const fp = makeFingerprint(msg);
+    const fpStripped = makeFingerprintStripped(msg);
+    const canUseReceivedAt = index === latestUserIndex && !tsDB[fp] && !tsDB[fpStripped];
+    const timestamp = contentTimestamp || (canUseReceivedAt ? receivedAt : null);
+    if (!timestamp) continue;
+    const isoTimestamp = timestamp.toISOString();
+    if (!tsDB[fp]) { tsDB[fp] = isoTimestamp; dirty = true; }
+    if (!tsDB[fpStripped]) { tsDB[fpStripped] = isoTimestamp; dirty = true; }
+  }
+  return dirty;
+}
+
 // ========================
 // 消息判断
 // ========================
@@ -571,17 +589,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
-    let tsDBDirty = false;
-    for (const msg of kelivoMessages) {
-      if (msg.role === "system") continue;
-      if (msg.role === "tool") continue;
-      const ts = extractTimestamp(normalizeContentToText(msg.content));
-      if (!ts) continue;
-      const fp = makeFingerprint(msg);
-      const fpStripped = makeFingerprintStripped(msg);
-      if (!tsDB[fp]) { tsDB[fp] = ts.toISOString(); tsDBDirty = true; }
-      if (!tsDB[fpStripped]) { tsDB[fpStripped] = ts.toISOString(); tsDBDirty = true; }
-    }
+    const tsDBDirty = rememberMessageTimestamps(kelivoMessages, tsDB);
     if (tsDBDirty) saveTimestampDB(tsDB);
 
     const finalTimeline = buildTimeline(kelivoMessages, tsDB);
@@ -1760,7 +1768,8 @@ if (!fs.existsSync(TIMELINE_FILE)) {
 // ========================
 // 启动服务
 // ========================
-app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
+function startServer() {
+  app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
   if (err) {
     console.error(err);
     process.exit(1);
@@ -1777,4 +1786,9 @@ app.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
     data_dir_ready: fs.existsSync(DATA_DIR)
   }));
   console.log(`✅ Gateway 运行在 ${address}`);
-});
+  });
+}
+
+if (require.main === module) startServer();
+
+module.exports = { app, rememberMessageTimestamps, startServer };
