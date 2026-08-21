@@ -1752,6 +1752,11 @@ app.get("/admin/test-bark", { preHandler: basicAuth }, async (req, reply) => {
 app.get('/ping', (req, res) => {
     res.status(200).send('OK');
 });
+// 确保 enhanced_messages.json 存在（供 wake_up.js 读取）
+if (!fs.existsSync(TIMELINE_FILE)) {
+    fs.writeFileSync(TIMELINE_FILE, JSON.stringify([], null, 2), 'utf-8');
+    console.log('📝 已创建 enhanced_messages.json');
+}
 // ========================
 // 启动服务
 // ========================
