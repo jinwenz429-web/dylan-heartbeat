@@ -289,14 +289,16 @@ function extractTimestampWithMemory(msg, tsDB) {
 
 function rememberMessageTimestamps(messages, tsDB, receivedAt = new Date()) {
   let dirty = false;
-  for (const msg of messages) {
+  const latestUserIndex = messages.findLastIndex(msg => msg.role === "user");
+  for (const [index, msg] of messages.entries()) {
     if (msg.role === "system" || msg.role === "tool") continue;
     const contentTimestamp = extractTimestamp(normalizeContentToText(msg.content));
-    const timestamp = contentTimestamp || (msg.role === "user" ? receivedAt : null);
-    if (!timestamp) continue;
-    const isoTimestamp = timestamp.toISOString();
     const fp = makeFingerprint(msg);
     const fpStripped = makeFingerprintStripped(msg);
+    const canUseReceivedAt = index === latestUserIndex && !tsDB[fp] && !tsDB[fpStripped];
+    const timestamp = contentTimestamp || (canUseReceivedAt ? receivedAt : null);
+    if (!timestamp) continue;
+    const isoTimestamp = timestamp.toISOString();
     if (!tsDB[fp]) { tsDB[fp] = isoTimestamp; dirty = true; }
     if (!tsDB[fpStripped]) { tsDB[fpStripped] = isoTimestamp; dirty = true; }
   }
