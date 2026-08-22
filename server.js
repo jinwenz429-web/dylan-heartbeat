@@ -705,14 +705,17 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }
 
     const requestedStream = body?.stream === true;
+    const conversationId = String(req.headers["x-conversation-id"] || "").trim();
+    const upstreamHeaders = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+    };
+    if (conversationId) upstreamHeaders["X-Conversation-Id"] = conversationId;
 
     // 请求模型
     const response = await fetch(TARGET_API_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
-      },
+      headers: upstreamHeaders,
       body: JSON.stringify({ ...body, messages: llmMessages })
     });
 
