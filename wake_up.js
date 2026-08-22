@@ -2,6 +2,7 @@ require("dotenv").config({ quiet: true });
 const fs = require("fs");
 const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
+const { persistDiaryRemote } = require("./diary_persistence");
 const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
 const { parseChatCompletionResponse } = require("./upstream_response");
 const {
@@ -25,6 +26,7 @@ const WEATHER_TIMEOUT_MS = 5000;
 const DIARY_DIR_NAME = process.env.DIARY_DIR || "diary";
 const DIARY_DIR_PATH = runtimeDirectory(DIARY_DIR_NAME, "diary");
 const PUSH_TIMEOUT_MS = readPositiveTimeout("PUSH_TIMEOUT_MS", 15_000);
+const DIARY_REMOTE_TIMEOUT_MS = readPositiveTimeout("DIARY_REMOTE_TIMEOUT_MS", 15_000);
 const WAKE_UPSTREAM_TIMEOUT_MS = readPositiveTimeout("WAKE_UPSTREAM_TIMEOUT_MS", 300_000);
 
 function readPositiveTimeout(key, fallback) {
@@ -70,7 +72,7 @@ function extractDiaryFromResponse(text) {
   };
 }
 
-function appendDiaryEntry(content) {
+async function appendDiaryEntry(content) {
   if (!readBooleanEnv("DIARY_ENABLED", true)) {
     console.log("模型写了日记，但 DIARY_ENABLED=false，本次不保存");
     return false;
@@ -79,12 +81,38 @@ function appendDiaryEntry(content) {
   const cleanContent = String(content || "").trim();
   if (!cleanContent) return false;
 
-  fs.mkdirSync(DIARY_DIR_PATH, { recursive: true });
-  const diaryFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString()}.md`);
-  const entry = `\n\n## ${getDiaryTimeString()}\n\n${cleanContent}\n`;
-  fs.appendFileSync(diaryFile, entry, "utf-8");
-  console.log(`已保存日记：${diaryFile}`);
-  return true;
+  const remoteResult = await persistDiaryRemote({
+    content: cleanContent,
+    metadata: {
+      source: "dylan-heartbeat",
+      generated_at: getDiaryTimeString()
+    },
+    targetApiUrl: process.env.TARGET_API_URL,
+    diaryApiUrl: process.env.PAWWAKE_DIARY_URL,
+    gatewayKey: process.env.PAWWAKE_GATEWAY_KEY,
+    timeoutMs: DIARY_REMOTE_TIMEOUT_MS
+  });
+
+  if (remoteResult.ok) {
+    console.log("已持久化日记到 Pawwake/Neon");
+    return true;
+  }
+
+  console.log(
+    `Pawwake 日记持久化失败，回退本地 md：${remoteResult.reason || "unknown"}`
+  );
+
+  try {
+    fs.mkdirSync(DIARY_DIR_PATH, { recursive: true });
+    const diaryFile = path.join(DIARY_DIR_PATH, `${getDiaryDateString()}.md`);
+    const entry = `\n\n## ${getDiaryTimeString()}\n\n${cleanContent}\n`;
+    fs.appendFileSync(diaryFile, entry, "utf-8");
+    console.log(`已保存本地 fallback 日记：${diaryFile}`);
+    return true;
+  } catch (error) {
+    console.error("远程和本地日记保存均失败：", error.message || String(error));
+    return false;
+  }
 }
 
 // 批注 2026-07-11：推送层扩展为 Bark/ntfy；默认仍走 Bark，保护旧部署不改 .env 也能继续运行。
@@ -602,7 +630,7 @@ ${historyText}`
   console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
 
   const diaryResult = extractDiaryFromResponse(rawAiText);
-  const diarySaved = appendDiaryEntry(diaryResult.diaryContent);
+  const diarySaved = await appendDiaryEntry(diaryResult.diaryContent);
   const aiText = diaryResult.remainingText;
 
   let eventContent;
@@ -733,4 +761,10 @@ if (require.main === module) {
   console.log("==================================\n");
 }
 
-module.exports = { getLastUserTime, parseTimelineTimestamp, sendPushNotification };
+module.exports = {
+  appendDiaryEntry,
+  getLastUserTime,
+  parseTimelineTimestamp,
+  runWakeUp,
+  sendPushNotification
+};
