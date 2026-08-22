@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { trimTimeline } = require("./timeline_retention");
 
 const PROJECT_DIR = __dirname;
 
@@ -32,7 +33,10 @@ function writeJsonAtomicSync(filePath, value) {
   fs.mkdirSync(dir, { recursive: true });
   const temporary = `${filePath}.tmp-${process.pid}-${Date.now()}`;
   const backup = `${filePath}.bak`;
-  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+  const valueToWrite = path.basename(filePath) === "enhanced_messages.json"
+    ? trimTimeline(value)
+    : value;
+  fs.writeFileSync(temporary, `${JSON.stringify(valueToWrite, null, 2)}\n`, "utf-8");
   try {
     if (fs.existsSync(filePath)) fs.copyFileSync(filePath, backup);
     fs.renameSync(temporary, filePath);
