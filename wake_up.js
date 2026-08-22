@@ -3,6 +3,11 @@ const fs = require("fs");
 const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
 const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
+const {
+  hashConversationId,
+  loadLastActiveConversation,
+  normalizeConversationId
+} = require("./conversation_state");
 const { parseChatCompletionResponse } = require("./upstream_response");
 const {
   formatDateTimeInTimeZone,
@@ -440,6 +445,16 @@ function getLastUserTime(messages, timestampDB = loadTimestampDB()) {
   return null;
 }
 
+function buildWakeHeaders(targetApiKey, activeConversation) {
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${targetApiKey}`
+  };
+  const conversationId = normalizeConversationId(activeConversation?.conversationId);
+  if (conversationId) headers["X-Conversation-Id"] = conversationId;
+  return headers;
+}
+
 function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
 }
@@ -568,15 +583,19 @@ ${historyText}`
     return;
   }
 
+  const activeConversation = loadLastActiveConversation();
+  if (activeConversation) {
+    console.log(`wake_conversation source=last_active id_hash=${hashConversationId(activeConversation.conversationId)}`);
+  } else {
+    console.log("wake_conversation source=fallback");
+  }
+
   const response = await fetch(process.env.TARGET_API_URL, {
     method: "POST",
     // 批注 2026-08-10：上游只建连不结束时，旧循环永远不会安排下一次检查；
     // 五分钟默认总超时只作兜底，可由 WAKE_UPSTREAM_TIMEOUT_MS 调整。
     signal: AbortSignal.timeout(WAKE_UPSTREAM_TIMEOUT_MS),
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.TARGET_API_KEY}`
-    },
+    headers: buildWakeHeaders(process.env.TARGET_API_KEY, activeConversation),
     body: JSON.stringify({
       model: process.env.MODEL_NAME,
       messages: wakeMessages,
@@ -733,4 +752,4 @@ if (require.main === module) {
   console.log("==================================\n");
 }
 
-module.exports = { getLastUserTime, parseTimelineTimestamp, sendPushNotification };
+module.exports = { buildWakeHeaders, getLastUserTime, parseTimelineTimestamp, sendPushNotification };
