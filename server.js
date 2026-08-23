@@ -17,6 +17,7 @@ const {
   normalizeConversationId,
   saveLastActiveConversation
 } = require("./conversation_state");
+const { saveLastUserReceivedAt } = require("./last_user_state");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
@@ -334,6 +335,16 @@ function isSystemRule(msg) {
   return false;
 }
 
+function isRealUserActivityRequest(messages, conversationId) {
+  if (!conversationId || !Array.isArray(messages) || messages.length === 0) return false;
+  const latestMessage = messages[messages.length - 1];
+  return Boolean(
+    latestMessage &&
+    latestMessage.role === "user" &&
+    isRealMessageForTimeline(latestMessage)
+  );
+}
+
 // ========================
 // 构建 Timeline
 // ========================
@@ -580,6 +591,7 @@ app.get("/v1/models", async (req, reply) => {
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
   try {
+    const requestReceivedAt = new Date();
     const body = req.body;
     const conversationId = normalizeConversationId(req.headers["x-conversation-id"]);
     if (conversationId) {
@@ -599,7 +611,10 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
-    const tsDBDirty = rememberMessageTimestamps(kelivoMessages, tsDB);
+    const tsDBDirty = rememberMessageTimestamps(kelivoMessages, tsDB, requestReceivedAt);
+    if (isRealUserActivityRequest(kelivoMessages, conversationId)) {
+      saveLastUserReceivedAt(requestReceivedAt);
+    }
     if (tsDBDirty) saveTimestampDB(tsDB);
 
     const finalTimeline = buildTimeline(kelivoMessages, tsDB);
