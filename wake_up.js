@@ -9,6 +9,7 @@ const {
   loadLastActiveConversation,
   normalizeConversationId
 } = require("./conversation_state");
+const { loadLastUserReceivedAt } = require("./last_user_state");
 const { parseChatCompletionResponse } = require("./upstream_response");
 const {
   formatDateTimeInTimeZone,
@@ -470,6 +471,8 @@ function getLastUserTime(messages, timestampDB = loadTimestampDB()) {
       if (receivedAt) return { time: receivedAt, source: "received_at" };
     }
   }
+  const persisted = loadLastUserReceivedAt();
+  if (persisted) return { time: persisted, source: "last_user_state" };
   return null;
 }
 
