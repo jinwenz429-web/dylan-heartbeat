@@ -345,6 +345,33 @@ function isRealUserActivityRequest(messages, conversationId) {
   );
 }
 
+function isAuxiliaryChatRequest(messages, skipHeader) {
+  if (String(skipHeader || "").toLowerCase() === "true") return true;
+  if (!Array.isArray(messages)) return false;
+  const users = messages.filter(msg => msg?.role === "user");
+  if (users.length !== 1 || messages.some(msg => msg?.role === "tool" || msg?.tool_calls?.length)) return false;
+  const userText = normalizeContentToText(users[0].content).trim();
+  const systemText = messages.filter(msg => msg?.role === "system")
+    .map(msg => normalizeContentToText(msg.content)).join("\n");
+  if (systemText.includes("Generate candidate next messages that the USER can send to the assistant")
+      && systemText.includes('"suggestions"')
+      && userText.startsWith("Suggest up to 3 useful next messages for the user, based on the conversation below.")
+      && userText.includes('Output only JSON: {"suggestions":')) return true;
+  const text = userText.toLowerCase();
+  if (["summarize the conversation between user and assistant into a short title",
+       "summarize the conversation into a short title",
+       "generate a concise title for the conversation",
+       "generate a short title for the conversation"].some(signature => text.includes(signature))) return true;
+  const markerGroups = [
+    ["<content>", "</content>"],
+    ["reply directly with the title", "only output the title", "只输出标题", "直接输出标题"],
+    ["title should not exceed", "title must not exceed", "标题不超过", "标题不得超过"],
+    ["conversation between user and assistant", "dialogue between user and assistant", "用户和助手的对话", "用户与助手的对话"],
+    ["short title", "concise title", "简短标题", "简洁标题"]
+  ];
+  return markerGroups.filter(markers => markers.some(marker => text.includes(marker))).length >= 3;
+}
+
 // ========================
 // 构建 Timeline
 // ========================
@@ -593,8 +620,10 @@ app.post("/v1/chat/completions", async (req, reply) => {
   try {
     const requestReceivedAt = new Date();
     const body = req.body;
+    const kelivoMessages = body.messages || [];
+    const auxiliaryRequest = isAuxiliaryChatRequest(kelivoMessages, req.headers["x-skip-conversation-log"]);
     const conversationId = normalizeConversationId(req.headers["x-conversation-id"]);
-    if (conversationId) {
+    if (conversationId && !auxiliaryRequest) {
       saveLastActiveConversation(conversationId);
       console.log(`active_conversation_saved id_hash=${hashConversationId(conversationId)}`);
     }
@@ -604,25 +633,24 @@ app.post("/v1/chat/completions", async (req, reply) => {
       event: "kelivo_request",
       model: body?.model || "",
       stream: body?.stream === true,
+      auxiliary: auxiliaryRequest,
       messages: summarizeMessagesForLog(body?.messages || [])
     }));
 
-    const kelivoMessages = body.messages || [];
-    const oldTimeline = loadTimeline();
+    const oldTimeline = auxiliaryRequest ? [] : loadTimeline();
 
-    const tsDB = loadTimestampDB();
-    const tsDBDirty = rememberMessageTimestamps(kelivoMessages, tsDB, requestReceivedAt);
-    if (isRealUserActivityRequest(kelivoMessages, conversationId)) {
+    const tsDB = auxiliaryRequest ? {} : loadTimestampDB();
+    const tsDBDirty = !auxiliaryRequest && rememberMessageTimestamps(kelivoMessages, tsDB, requestReceivedAt);
+    if (!auxiliaryRequest && isRealUserActivityRequest(kelivoMessages, conversationId)) {
       saveLastUserReceivedAt(requestReceivedAt);
     }
     if (tsDBDirty) saveTimestampDB(tsDB);
 
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
-    saveTimeline(finalTimeline);
+    if (!auxiliaryRequest) saveTimeline(buildTimeline(kelivoMessages, tsDB));
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
-    const llmMessages = kelivoMessages
+    const llmMessages = auxiliaryRequest ? kelivoMessages.slice() : kelivoMessages
       .map(prepareMessageForLLM)
       .filter(Boolean);
 
@@ -735,6 +763,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
       Authorization: `Bearer ${process.env.TARGET_API_KEY}`
     };
     if (conversationId) upstreamHeaders["X-Conversation-Id"] = conversationId;
+    if (auxiliaryRequest) upstreamHeaders["X-Skip-Conversation-Log"] = "true";
 
     // 请求模型
     const response = await fetch(TARGET_API_URL, {
