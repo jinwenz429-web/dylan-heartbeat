@@ -18,6 +18,15 @@ const {
   saveLastActiveConversation
 } = require("./conversation_state");
 const { saveLastUserReceivedAt } = require("./last_user_state");
+const { readGuardConfig, guardAppliesToModel } = require("./persona_guard_config");
+const {
+  createStreamObserver,
+  filterQuarantinedInbound,
+  guardCompleteResponse,
+  newRequestId
+} = require("./persona_guard_gateway");
+const { readGuardLog } = require("./persona_guard_diagnostics");
+const { loadQuarantine } = require("./persona_quarantine");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
@@ -620,9 +629,27 @@ app.post("/v1/chat/completions", async (req, reply) => {
   try {
     const requestReceivedAt = new Date();
     const body = req.body;
-    const kelivoMessages = body.messages || [];
+    let kelivoMessages = body.messages || [];
     const auxiliaryRequest = isAuxiliaryChatRequest(kelivoMessages, req.headers["x-skip-conversation-log"]);
     const conversationId = normalizeConversationId(req.headers["x-conversation-id"]);
+    // Persona Guard：总开关关闭时这一段什么都不做。开启后，Kelivo 带回来的已隔离回复
+    // 不再进入时间线（心跳/日记的来源）和发给模型的上下文。
+    const guardConfig = readGuardConfig();
+    const guardModel = body?.model || configuredModelName();
+    const guardActive = !auxiliaryRequest && guardAppliesToModel(guardConfig, guardModel);
+    const guardRequestId = guardActive ? newRequestId() : "";
+    const guardConversationHash = conversationId ? hashConversationId(conversationId) : "";
+    if (guardConfig.enabled && !auxiliaryRequest) {
+      try {
+        const filtered = filterQuarantinedInbound(kelivoMessages);
+        if (filtered.removed > 0) {
+          kelivoMessages = filtered.messages;
+          console.log(JSON.stringify({ event: "persona_guard", inbound_filtered: filtered.removed, conversation_hash: guardConversationHash }));
+        }
+      } catch (error) {
+        console.warn(`persona_guard_inbound_filter_failed ${error.message}`);
+      }
+    }
     if (conversationId && !auxiliaryRequest) {
       saveLastActiveConversation(conversationId);
       console.log(`active_conversation_saved id_hash=${hashConversationId(conversationId)}`);
@@ -765,6 +792,12 @@ app.post("/v1/chat/completions", async (req, reply) => {
     if (conversationId) upstreamHeaders["X-Conversation-Id"] = conversationId;
     if (auxiliaryRequest) upstreamHeaders["X-Skip-Conversation-Log"] = "true";
 
+    if (guardActive) {
+      upstreamHeaders["X-Persona-Guard-Request-Id"] = guardRequestId;
+      upstreamHeaders["X-Persona-Guard-Attempt"] = "0";
+      upstreamHeaders["X-Persona-Guard-Stage"] = "initial";
+    }
+
     // 请求模型
     const response = await fetch(TARGET_API_URL, {
       method: "POST",
@@ -774,6 +807,48 @@ app.post("/v1/chat/completions", async (req, reply) => {
 
     const upstreamContentType = response.headers.get("content-type") || "";
     const shouldStreamResponse = requestedStream || upstreamContentType.includes("text/event-stream");
+    // 缓冲模式（默认关闭）：整条回复先在服务端检测，通过后再一次性发给客户端，首字延迟会变长。
+    const guardBuffered = guardActive && (!shouldStreamResponse || guardConfig.bufferStream);
+
+    if (guardBuffered) {
+      const initialText = await response.text();
+      let guarded;
+      try {
+        guarded = await guardCompleteResponse({
+          initialText,
+          initialStatus: response.status,
+          initialContentType: upstreamContentType,
+          messages: llmMessages,
+          body,
+          stream: shouldStreamResponse,
+          url: TARGET_API_URL,
+          headers: upstreamHeaders,
+          config: guardConfig,
+          requestId: guardRequestId,
+          conversationHash: guardConversationHash,
+          model: guardModel
+        });
+      } catch (error) {
+        // 检测/恢复模块故障：安全降级为原样返回
+        console.warn(`persona_guard_failed_open ${error.message}`);
+        guarded = { status: response.status, contentType: upstreamContentType, bodyText: initialText, headers: {} };
+      }
+      if (shouldStreamResponse) {
+        reply.raw.writeHead(guarded.status, {
+          "Content-Type": guarded.contentType || "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          ...guarded.headers
+        });
+        reply.raw.end(guarded.bodyText);
+        return;
+      }
+      for (const [key, value] of Object.entries(guarded.headers)) reply.header(key, value);
+      return reply
+        .code(guarded.status)
+        .header("Content-Type", guarded.contentType || "application/json")
+        .send(guarded.bodyText);
+    }
 
     // 批注 2026-07-11：Kelivo 关闭 stream 时需要收到普通 JSON；只在请求或上游确认为 SSE 时才按流式直通。
     if (!shouldStreamResponse) {
@@ -794,11 +869,31 @@ app.post("/v1/chat/completions", async (req, reply) => {
       Connection: "keep-alive"
     });
 
+    // 流式直通 + 旁路检测：字节不做任何改动，结束后才判断；确认漂移只在服务端隔离。
+    const observer = guardActive && response.ok
+      ? createStreamObserver({
+          config: guardConfig,
+          requestId: guardRequestId,
+          conversationHash: guardConversationHash,
+          model: guardModel,
+          messages: llmMessages,
+          contentType: upstreamContentType
+        })
+      : null;
+    let streamAborted = false;
     const reader = response.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      reply.raw.write(value);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        reply.raw.write(value);
+        if (observer) observer.push(value);
+      }
+    } catch (error) {
+      streamAborted = true;
+      throw error;
+    } finally {
+      if (observer) observer.finish({ aborted: streamAborted });
     }
     reply.raw.end();
   } catch (err) {
@@ -1771,6 +1866,16 @@ app.post("/admin/presets/delete", { preHandler: basicAuth }, async (req, reply) 
 // ========================
 // 心跳接口
 // ========================
+app.get("/admin/persona-guard", { preHandler: basicAuth }, async (req, reply) => {
+  // 只读诊断：最近的检测记录（不含正文）+ 隔离条目数
+  const config = readGuardConfig();
+  reply.send({
+    config: { ...config, fallbackApiKeyEnv: config.fallbackApiKeyEnv ? "(set)" : "" },
+    quarantine_entries: loadQuarantine().length,
+    recent: readGuardLog(100)
+  });
+});
+
 app.post("/internal/heartbeat", async (req, reply) => {
   wakeUpLastHeartbeat = Date.now();
   reply.send({ status: "ok" });

@@ -11,6 +11,10 @@ const {
 } = require("./conversation_state");
 const { loadLastUserReceivedAt } = require("./last_user_state");
 const { parseChatCompletionResponse } = require("./upstream_response");
+const { readGuardConfig, guardAppliesToModel } = require("./persona_guard_config");
+const { STATUS: GUARD_STATUS, detectDrift } = require("./persona_guard");
+const { isQuarantinedMessage, quarantinedFingerprintSet } = require("./persona_quarantine");
+const { logGuardEvent } = require("./persona_guard_diagnostics");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -536,8 +540,11 @@ async function runWakeUp() {
   console.log("开始自动唤醒");
   console.log("==========================\n");
 
-  const messages = loadTimelineMessages();
-  if (!messages) return;
+  const loadedMessages = loadTimelineMessages();
+  if (!loadedMessages) return;
+  const guardConfig = readGuardConfig();
+  // 已隔离的漂移回复不参与心跳回忆（防止 guard 启用前写进时间线的旧条目继续影响）
+  const messages = guardConfig.enabled ? excludeQuarantined(loadedMessages) : loadedMessages;
 
   const lastUser = getLastUserTime(messages);
   if (!lastUser) {
@@ -651,6 +658,20 @@ ${historyText}`
   console.log("\nWake Result Summary:\n");
   console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
 
+  if (isWakeOutputDrifted(rawAiText, cleanMessages, guardConfig)) {
+    // 心跳回复出现确认漂移：不推送、不写日记，只记一条中性事件；下个周期自然会再醒。
+    try {
+      await fetch(GATEWAY_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: `（${getLocalTimeString()} 自动唤醒：本次未发送推送）` })
+      });
+    } catch (err) {
+      console.error("记录唤醒事件失败:", err.message);
+    }
+    return;
+  }
+
   const diaryResult = extractDiaryFromResponse(rawAiText);
   const diarySaved = await appendDiaryEntry(diaryResult.diaryContent);
   const aiText = diaryResult.remainingText;
@@ -745,6 +766,44 @@ ${historyText}`
 }
 
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
+function excludeQuarantined(messages) {
+  try {
+    const set = quarantinedFingerprintSet();
+    if (set.size === 0) return messages;
+    return messages.filter(msg => !isQuarantinedMessage(msg, set));
+  } catch {
+    return messages;
+  }
+}
+
+function isWakeOutputDrifted(rawAiText, recentMessages, guardConfig = readGuardConfig()) {
+  if (!guardConfig.enabled || !guardConfig.checkWake) return false;
+  if (!guardAppliesToModel(guardConfig, process.env.MODEL_NAME)) return false;
+  try {
+    // 唤醒请求的 user 段是系统拼的回忆文本，不是用户在说话，所以不传 userMessage
+    const verdict = detectDrift({
+      reply: rawAiText,
+      userMessage: "",
+      recentMessages: (recentMessages || []).filter(msg => msg?.role !== "system"),
+      aiSelfAwarePersona: guardConfig.aiSelfAwarePersona
+    });
+    if (verdict.status !== GUARD_STATUS.NORMAL) {
+      logGuardEvent({
+        source: "wake",
+        model: process.env.MODEL_NAME || "",
+        status: verdict.status,
+        rules: verdict.rules,
+        detect_ms: verdict.latencyMs,
+        state: verdict.status === GUARD_STATUS.CONFIRMED_DRIFT ? "QUARANTINED" : "COMMITTED"
+      }, { enabled: guardConfig.diagnostics });
+    }
+    return verdict.status === GUARD_STATUS.CONFIRMED_DRIFT;
+  } catch (error) {
+    console.warn(`persona_guard_wake_check_failed ${error.message}`);
+    return false;
+  }
+}
+
 function getCheckIntervalMs() {
   // 批注 2026-06-26：公开版允许用户在管理页调整唤醒检查频率；默认值保持旧版白天10分钟、夜间2小时。
   return getCheckIntervalMinutes(new Date()) * 60 * 1000;
@@ -787,6 +846,7 @@ module.exports = {
   appendDiaryEntry,
   buildWakeHeaders,
   getLastUserTime,
+  isWakeOutputDrifted,
   parseTimelineTimestamp,
   runWakeUp,
   sendPushNotification
